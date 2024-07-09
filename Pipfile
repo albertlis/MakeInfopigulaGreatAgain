@@ -4,12 +4,14 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-selenium = "*"
 beautifulsoup4 = "*"
-webdriver-manager = "*"
-schedule = "*"
-yagmail = "*"
+easydict = "*"
+pyyaml = "*"
 requests-html = "*"
+schedule = "*"
+selenium = "*"
+webdriver-manager = "*"
+yagmail = "*"
 
 [dev-packages]
 
