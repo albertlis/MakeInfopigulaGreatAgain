@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "MakeInfopigulaGreatAgain"
+version = "0.1.0"
+description = "cmd app for collecting weekly info from infopigula and send it trough email"
+authors = ["Somebody ToLove <stl@protonmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+beautifulsoup4 = "*"
+python-dotenv = "*"
+requests-html = "*"
+schedule = "*"
+selenium = "*"
+yagmail = "*"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

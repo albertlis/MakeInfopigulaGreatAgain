@@ -1,18 +1,18 @@
 import logging
+import os
+import platform
 import time
 
 import schedule as schedule
 import yagmail as yagmail
-import yaml
 from bs4 import BeautifulSoup
-from easydict import EasyDict
+from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 def scroll_to_bottom(driver: WebDriver, num_scrolls: int) -> None:
@@ -21,19 +21,50 @@ def scroll_to_bottom(driver: WebDriver, num_scrolls: int) -> None:
         time.sleep(5)
 
 
-def get_driver() -> webdriver.Chrome:
-    op = webdriver.ChromeOptions()
-    op.add_argument('--headless')
-    op.add_argument("window-size=1920,1080")  # Specify resolution
-    # options.add_argument("--no-sandbox")
-    # options.add_argument("--disable-dev-shm-usage")
-    # options.add_argument("--disable-gpu")
+# def get_driver() -> webdriver.Chrome:
+#     op = webdriver.ChromeOptions()
+#     op.add_argument('--headless')
+#     op.add_argument("window-size=1920,1080")  # Specify resolution
+#     # options.add_argument("--no-sandbox")
+#     # options.add_argument("--disable-dev-shm-usage")
+#     # options.add_argument("--disable-gpu")
 
-    # Define a user agent
-    op.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/2b7c7"
+#     # Define a user agent
+#     op.add_argument(
+#         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/2b7c7"
+#     )
+#     return webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=op)
+
+def get_driver() -> webdriver.Chrome:
+    system = platform.system()
+    if system not in {"Windows", "Linux"}:
+        raise ValueError("This driver only works on Windows and Linux systems.")
+
+    browser = 'chrome' if system == "Linux" else 'edge'
+
+    options = webdriver.ChromeOptions() if browser == 'chrome' else webdriver.EdgeOptions()
+    options.add_argument("window-size=1400,1080")
+    options.add_argument("--disk-cache-size=10485760")
+    options.add_argument('--headless')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--log-level=3')
+    options.add_argument('--no-sandbox')
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-plugins-discovery")
+
+    if browser == 'chrome':
+        options.binary_location = "/usr/bin/chromium-browser"
+    # Disable loading images for better performance
+    prefs = {"profile.managed_default_content_settings.images": 2}
+    options.add_experimental_option("prefs", prefs)
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/58.0.3029.110 Safari/2b7c7"
     )
-    return webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=op)
+    if browser == "chrome":
+        return webdriver.Chrome(options, Service(executable_path="/usr/bin/chromedriver"))
+    else:
+        return webdriver.Chrome(options=options)
 
 
 def get_news(driver: WebDriver) -> str:
@@ -67,13 +98,15 @@ def move_to_word_news(driver: WebDriver) -> None:
 
 def send_mail(html_content: str) -> None:
     email_subject = 'Infopiguła news'
-    with open('secrets.yml', 'rt') as f:
-        secrets = EasyDict(yaml.safe_load(f))
-    yag = yagmail.SMTP(secrets.src_mail, secrets.src_pwd, port=587, smtp_starttls=True, smtp_ssl=False)
-    yag.send(to=secrets.dst_mail, subject=email_subject, contents=(html_content, 'text/html'))
+    yag = yagmail.SMTP(os.getenv('SRC_MAIL'), os.getenv('SRC_PWD'), port=587, smtp_starttls=True, smtp_ssl=False)
+    yag.send(to=os.getenv('DST_MAIL'), subject=email_subject, contents=(html_content, 'text/html'))
 
 
 def main() -> None:
+    if platform.system() == "Linux":
+        os.nice(10)
+        
+    load_dotenv()
     driver = get_driver()
     driver.maximize_window()
     url = 'https://infopigula.pl/#/'
@@ -110,14 +143,22 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    logging.basicConfig(filename='error.log', level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
-    try:
-        schedule.every().saturday.at("12:00").do(main)
-        while True:
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - Line: %(lineno)d - %(filename)s - %(funcName)s() - %(message)s',
+        level=logging.DEBUG
+    )
+    logging.getLogger("selenium").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    schedule.every().saturday.at("12:00").do(main)
+    i = 0
+    while True:
+        try:
             schedule.run_pending()
-            time.sleep(1)
-    except Exception as e:
-        logging.exception("An error occurred:")
-        raise
+            time.sleep(10)
+        except Exception as e:
+            logging.exception("An error occurred:")
+            i += 1
+            if i > 10:
+                logging.error('Exiting program due to too many errors')
+                break
     # main()
-
