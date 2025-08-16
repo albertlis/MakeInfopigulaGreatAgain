@@ -2,9 +2,7 @@
 name = "make-infopigula-great-again"
 version = "0.1.0"
 description = "Web scraper and email notifier for Infopiguła"
-authors = [
-    {name = "Your Name", email = "you@example.com"},
-]
+authors = ["Your Name <you@example.com>"]
 license = { text = "MIT" }
 dependencies = [
   "schedule>=1.1.0",
