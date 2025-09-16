@@ -3,10 +3,11 @@ import logging
 import os
 import smtplib
 import time
-from datetime import datetime
+from datetime import datetime, timedelta  # added timedelta
 
 import schedule
 import yagmail
+from datetime import timezone
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Page
 
@@ -18,6 +19,7 @@ load_dotenv()
 URL = "https://infopigula.pl/#/"
 DATA_FILE = "data.json"
 LOG_FILE = "scraper.log"
+STATE_FILE = "state.json"  # new: track last successful scrape
 
 # Email settings from .env
 SMTP_USER = os.getenv("SRC_MAIL")
@@ -27,9 +29,18 @@ RECIPIENT_EMAIL = os.getenv("DST_MAIL")
 
 # Scraping
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36"
-HEADLESS_MODE = True  # Set to False for debugging
-BROWSER_TYPE = os.getenv("BROWSER_TYPE", "chromium").lower()  # chromium, edge, or vivaldi
-VIVALDI_PATH = os.getenv("VIVALDI_PATH")  # Required if BROWSER_TYPE is 'vivaldi'
+HEADLESS_MODE = True
+BROWSER_TYPE = os.getenv("BROWSER_TYPE", "chromium").lower()
+VIVALDI_PATH = os.getenv("VIVALDI_PATH")
+# New: list of tab labels to scrape (match visible text in p-tab)
+TABS_TO_SCRAPE = ["Polska", "Świat"]  # Extend e.g. ["Polska", "Świat", "Pozytywy"]
+
+# --- Optimization / Tuning Flags (new) ---
+ENABLE_RESOURCE_BLOCK = os.getenv("ENABLE_RESOURCE_BLOCK", "1") == "1"
+ENABLE_DEBUG_SELECTORS = os.getenv("ENABLE_DEBUG_SELECTORS", "0") == "1"
+MAX_PAGE_LOAD_RETRIES = int(os.getenv("MAX_PAGE_LOAD_RETRIES", "3"))
+RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "3"))
+PAGE_DEFAULT_TIMEOUT_MS = int(os.getenv("PAGE_DEFAULT_TIMEOUT_MS", "15000"))
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -56,38 +67,210 @@ def load_data() -> list:
 
 
 def save_data(data: list) -> None:
-    """Saves data to the JSON file."""
+    """Saves data to the JSON file (atomic write)."""
     try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        tmp_path = f"{DATA_FILE}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, DATA_FILE)
     except IOError as e:
         logging.error(f"Could not write to data file {DATA_FILE}: {e}")
 
 
+# --- State Management ---
+def load_state() -> dict:
+    """Loads scrape state (e.g., last successful scrape timestamp)."""
+    if not os.path.exists(STATE_FILE):
+        return {"last_successful_scrape": None}
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Could not read state file {STATE_FILE}: {e}")
+        return {"last_successful_scrape": None}
+
+
+def save_state(state: dict) -> None:
+    """Saves scrape state to the state file."""
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Could not write state file {STATE_FILE}: {e}")
+
+
+def mark_successful_scrape() -> None:
+    """Marks the current scrape as successful by updating the state file."""
+    state = load_state()
+    state["last_successful_scrape"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
+
+
 # --- Scraping Logic ---
+def click_tab(page: Page, tab_name: str) -> str | None:
+    """
+    Clicks a tab by its visible label (text content of <p-tab>) and returns the
+    CSS selector for its controlled panel (via aria-controls), or None if not found.
+    """
+    tab_locator = page.locator("div.p-tablist-tab-list").locator("p-tab", has_text=tab_name).first
+    try:
+        tab_locator.wait_for(state="visible", timeout=10000)
+    except PlaywrightTimeoutError:
+        logging.error(f"Tab '{tab_name}' not found.")
+        return None
+
+    tab_locator.click()
+    # Wait until aria-selected becomes true
+    for _ in range(20):
+        if tab_locator.get_attribute("aria-selected") == "true":
+            break
+        page.wait_for_timeout(250)
+    panel_id = tab_locator.get_attribute("aria-controls")
+    return f"#{panel_id}" if panel_id else None
+
+
 def scrape_tab_content(page: Page, tab_name: str) -> list:
-    """Scrapes article content from a specific tab ('Polska' or 'Świat')."""
+    """
+    Scrapes article content from a specific tab using the new <p-tab> structure.
+    Tries multiple fallback selectors to adapt to future minor changes.
+    """
     logging.info(f"Scraping tab: {tab_name}")
-    tab_selector = "#poland" if tab_name == "Polska" else "#global"
-    page.click(tab_selector)
-    page.wait_for_timeout(2000)  # Wait for content to switch
+    panel_selector = click_tab(page, tab_name)
+    container = None
+    if panel_selector:
+        try:
+            page.wait_for_selector(panel_selector, timeout=10000)
+            container = page.query_selector(panel_selector)
+        except PlaywrightTimeoutError:
+            logging.warning(f"Panel for tab '{tab_name}' did not appear. Falling back to full page.")
+    if not container:
+        container = page
+
+    # Potential article selectors (ordered by specificity)
+    # Updated: new structure uses app-news-content with span.news-content-data
+    candidate_selectors = [
+        "app-news-content span.news-content-data",   # NEW primary selector
+        "app-news-content .news-content-data",       # fallback (class only)
+        "app-news-content",                          # whole component if inner span missing
+        ".news-container",                           # container div
+        ".article__item",                            # legacy
+        "[data-article-id]",
+        "app-article-item",
+        ".article-item"
+    ]
 
     articles = []
-    article_elements = page.query_selector_all(".article__item")
-    for element in article_elements:
-        article_id = element.get_attribute("id")
-        if content_element := element.query_selector(".article__content"):
-            html_content = content_element.inner_html()
-            # Clean up the content a bit
-            if "<span>" in html_content:
-                html_content = html_content.split("<span>")[1].split("</span>")[0]
-            articles.append({"id": article_id, "content": html_content.strip(), "category": tab_name})
+    seen_texts = set()
+
+    for sel in candidate_selectors:
+        elements = container.query_selector_all(sel)
+        if not elements:
+            continue
+        for el in elements:
+            # If selector matched the inner span, keep it; else try to find the span for cleaner text.
+            content_el = (
+                el if "news-content-data" in sel
+                else el.query_selector("span.news-content-data") or el
+            )
+
+            raw_text = content_el.inner_text().strip() or content_el.inner_html().strip()
+            if not raw_text:
+                continue
+
+            # Normalize: collapse multi-line paragraphs and excessive whitespace.
+            normalized_text = " ".join(t.strip() for t in raw_text.splitlines() if t.strip())
+            if not normalized_text:
+                continue
+
+            # Skip obvious non-article promotional cards (heuristic)
+            if normalized_text.startswith("Codziennie o 6 rano"):
+                continue
+
+            if normalized_text in seen_texts:
+                continue
+            seen_texts.add(normalized_text)
+
+            article_id = (
+                el.get_attribute("id")
+                or el.get_attribute("data-article-id")
+                or str(abs(hash(normalized_text)))
+            )
+
+            articles.append({
+                "id": article_id,
+                "content": normalized_text,
+                "category": tab_name
+            })
+
+        if articles:
+            break  # stop at first selector yielding results
+
+    if not articles:
+        logging.warning(f"No articles found in tab '{tab_name}' (checked new structure selectors).")
     return articles
+
+
+def scrape_both_tabs(page: Page):
+    """
+    Scrapes articles from configured tabs (TABS_TO_SCRAPE) and merges them into storage.
+    """
+    all_new = []
+    for tab in TABS_TO_SCRAPE:
+        try:
+            all_new.extend(scrape_tab_content(page, tab))
+        except Exception as e:
+            logging.error(f"Error while scraping tab '{tab}': {e}", exc_info=True)
+
+    existing_data = load_data()
+    # Use dict for faster dedup (id -> record)
+    merged = {a['id']: a for a in existing_data}
+    added_count = 0
+    for a in all_new:
+        if a['id'] not in merged:
+            merged[a['id']] = a
+            added_count += 1
+    if added_count:
+        # Optional compaction: keep deterministic order (by category then id)
+        new_list = sorted(merged.values(), key=lambda x: (x['category'], x['id']))
+        save_data(new_list)
+    logging.info(f"Scraping finished. Added {added_count} new articles.")
+
+
+def _configure_page(page: Page):
+    """Apply performance tweaks (resource blocking, timeouts)."""
+    page.set_default_timeout(PAGE_DEFAULT_TIMEOUT_MS)
+    if ENABLE_RESOURCE_BLOCK:
+        def route_handler(route):
+            rtype = route.request.resource_type
+            if rtype in ("image", "media", "font"):
+                return route.abort()
+            route.continue_()
+        page.route("**/*", route_handler)
+
+
+def _load_with_retries(page: Page, url: str) -> bool:
+    """Retry page load with backoff."""
+    for attempt in range(1, MAX_PAGE_LOAD_RETRIES + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector("div.p-tablist-tab-list", timeout=30000)
+            return True
+        except PlaywrightTimeoutError:
+            logging.warning(f"Load attempt {attempt} failed.")
+        except Exception as e:
+            logging.warning(f"Load attempt {attempt} error: {e}")
+        if attempt < MAX_PAGE_LOAD_RETRIES:
+            sleep_time = RETRY_BACKOFF_SECONDS * attempt
+            logging.info(f"Retrying in {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
+    return False
 
 
 def daily_scrape() -> None:
     """Main daily scraping task."""
+    start_ts = time.perf_counter()
     logging.info("Starting daily scrape job.")
+    success_loaded = False  # new flag
     with sync_playwright() as p:
         try:
             browser_options = {"headless": HEADLESS_MODE}
@@ -104,40 +287,27 @@ def daily_scrape() -> None:
                 logging.info("Using Chromium browser.")
             browser = p.chromium.launch(**browser_options)
             page = browser.new_page(user_agent=USER_AGENT)
-            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_selector("#poland", timeout=30000)
-        except PlaywrightTimeoutError:
-            logging.error("Failed to load the initial page. Aborting scrape.")
-            return
+            _configure_page(page)
+            success_loaded = _load_with_retries(page, URL)
+            if not success_loaded:
+                logging.error("All page load attempts failed. Aborting.")
+                browser.close()
+                return
         except Exception as e:
             logging.error(f"An error occurred during browser setup: {e}")
             return
 
         try:
-            # Scrape both tabs
-            polska_articles = scrape_tab_content(page, "Polska")
-            swiat_articles = scrape_tab_content(page, "Świat")
-            new_articles = polska_articles + swiat_articles
-
-            # Aggregate data
-            existing_data = load_data()
-            existing_ids = {article['id'] for article in existing_data}
-
-            added_count = 0
-            for article in new_articles:
-                if article['id'] not in existing_ids:
-                    existing_data.append(article)
-                    existing_ids.add(article['id'])
-                    added_count += 1
-
-            if added_count > 0:
-                save_data(existing_data)
-            logging.info(f"Scraping finished. Added {added_count} new articles.")
-
+            scrape_both_tabs(page)
         except Exception as e:
             logging.error(f"An error occurred during scraping: {e}", exc_info=True)
         finally:
             browser.close()
+
+    if success_loaded:
+        mark_successful_scrape()
+        elapsed = time.perf_counter() - start_ts
+        logging.info(f"Recorded successful page load. Total scrape time: {elapsed:.2f}s")
 
 
 # --- Emailing ---
@@ -145,8 +315,24 @@ def send_weekly_summary() -> None:
     """Compiles and sends the weekly summary email, then clears the data file."""
     logging.info("Starting weekly summary job.")
 
-    if not all([SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL]):
-        logging.error("Email configuration is incomplete. Cannot send email.")
+    # Safety: ensure only runs once a week even if mis-scheduled
+    if datetime.now().weekday() != 5:  # 5 = Saturday
+        logging.info("Not Saturday; skipping weekly summary.")
+        return
+
+    # Skip if no successful scrape in last 7 days
+    state = load_state()
+    last_success_iso = state.get("last_successful_scrape")
+    if not last_success_iso:
+        logging.info("No successful scrapes recorded. Skipping email.")
+        return
+    try:
+        last_success = datetime.fromisoformat(last_success_iso)
+    except ValueError:
+        logging.warning("Invalid last_successful_scrape timestamp. Skipping email.")
+        return
+    if last_success < datetime.now(timezone.utc) - timedelta(days=7):
+        logging.info("No successful scrapes within last 7 days. Skipping email.")
         return
 
     weekly_data = load_data()
